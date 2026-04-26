@@ -1,0 +1,20 @@
+{
+  "enabledPlugins": {
+    "init-project@claude-project-workflow": true,
+    "exec-tasks@claude-project-workflow": true,
+    "post-session@claude-project-workflow": true
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "swift build 2>&1 | tail -40"
+          }
+        ]
+      }
+    ]
+  }
+}

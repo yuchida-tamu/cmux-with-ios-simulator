@@ -275,3 +275,44 @@ Notes:
 - README download button points to `releases/latest/download/cmux-macos.dmg`.
 - Versioning: bump the minor version for updates unless explicitly asked otherwise.
 - Changelog: update `CHANGELOG.md`; docs changelog is rendered from it.
+
+---
+
+## Project: iOS Simulator Surface (this fork's overlay)
+
+This repository (`yuchida-tamu/cmux-with-ios-simulator`) is a fork of `manaflow-ai/cmux` whose purpose is to add a `SurfaceType.simulator` — a cmux pane that hosts a live iOS Simulator framebuffer rendered via `IOSurface` → `CAMetalLayer`.
+
+End-state is an upstream PR back to `manaflow-ai/cmux` (see [ADR-0002](docs/adr/0002-fork-then-upstream-pr.md) for the contribution model and [ADR-0003](docs/adr/0003-graft-workflow-scaffold-on-fork.md) for why the workflow scaffold lives in-tree on this fork). Everything above this `---` is upstream cmux's `CLAUDE.md`, untouched. Everything below is this project's overlay and is **stripped before the upstream PR by `scripts/upstream-pr-prep.sh`** (per ADR-0003 §"M3 cleanup script").
+
+### Project pointers
+
+- **Project goal & scope:** [`docs/PRD.md`](docs/PRD.md)
+- **Domain vocabulary:** [`docs/glossary.md`](docs/glossary.md)
+- **Architecture decisions:** [`docs/adr/`](docs/adr/) — start with [ADR-0002 "Fork-then-upstream-PR"](docs/adr/0002-fork-then-upstream-pr.md) and [ADR-0003 "Graft workflow scaffold on the fork"](docs/adr/0003-graft-workflow-scaffold-on-fork.md)
+- **Per-task plans:** [`.memory/plans/`](.memory/plans/) (populated by `exec-tasks`)
+- **Spike write-ups:** `docs/spikes/NN-<slug>.md` (one per Spike issue in M1)
+- **Issue tracker / project board:** GitHub issues on this fork. Milestones `M1`/`M2`/`M3`, labels `P0`–`P3` and `type:feature`/`bug`/`chore`/`docs`.
+
+### Project principles (apply on top of upstream cmux's principles above)
+
+- **Match upstream cmux style first.** Before adding a new file or pattern, check how cmux already does it (`Sources/Panels/`, the `Panel` protocol, `CmuxConfig`). Don't introduce new abstractions if a cmux convention already exists — it has to land in upstream.
+- **Private Apple SPI lives behind one boundary.** All `CoreSimulator` / `FBSimulatorControl` private-header usage is confined to a single Swift module (`Sources/SimulatorKit/`) so it can be feature-flagged off, swapped to public APIs if Apple ever ships them, or mocked in tests.
+- **Spike write-ups in `docs/spikes/NN-<slug>.md`.** Each Spike issue lands a markdown file with: what we tried, what worked, what code refs to copy forward, what to throw away.
+- **Never link Apple private frameworks in CI artifacts that get distributed.** Private SPI is for local dev only; CI builds for distribution must stay clean for the eventual upstream PR.
+- **Fork-then-upstream-PR.** Every architectural choice must be defensible to a Manaflow maintainer at PR-review time. When upstream cmux disagrees with our preference, upstream wins. See [ADR-0002](docs/adr/0002-fork-then-upstream-pr.md).
+- **Cleanup discipline (ADR-0003).** Adding a workflow-scaffold file that the M3 cleanup script can't reverse is a contract violation. Either extend the script or don't add the file.
+
+### Project commands
+
+- **Project check (pre-PR, must pass):** upstream cmux's command — `xcodebuild -project GhosttyTabs.xcodeproj test` (or whatever upstream uses; defer to cmux's existing CI).
+- **PostToolUse hook (fast feedback during edits):** `swift build` — this is intentionally lighter than the pre-PR check so the hook stays responsive. Configured in `.claude/settings.json`. Comment out or downgrade if it becomes painful in `Sources/SimulatorKit/`.
+
+### Project workflow
+
+1. Branch from `main` of this fork.
+2. Read `docs/PRD.md`, the relevant ADR(s), and any matching `.memory/plans/<issue>-plan.md`.
+3. Implement.
+4. Run upstream cmux's check command (must pass).
+5. Push branch, open PR against this fork's `main` — `@claude` PR review fires here.
+6. On merge, sync `main` and delete the local branch.
+7. **At M3:** run `scripts/upstream-pr-prep.sh` to strip the workflow scaffold, then open the upstream PR against `manaflow-ai/cmux:main`.
