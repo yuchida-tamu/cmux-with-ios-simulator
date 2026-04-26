@@ -1,0 +1,8 @@
+# Glossary
+
+- **`SurfaceType.simulator`** — A new pane/surface variant in cmux (peer of `terminal` / `browser` / `markdown`) that hosts a live iOS Simulator framebuffer, rendered into a `CAMetalLayer`-backed `NSView` and driven by a headless `SimDevice`. The artifact this project delivers.
+- **Headless `SimDevice`** — A booted iOS Simulator instance that does NOT spawn `Simulator.app`. Created via `CoreSimulator`'s `SimDeviceSet` at a custom path, owned by our daemon (Option A) or the cmux process (Option B). Same mechanism `idb` and Facebook's `FBSimulatorControl` use.
+- **`IOSurface` framebuffer** — GPU-shareable opaque buffer that holds a single rendered Simulator frame. Exposed by `SimDisplayIOSurfaceRenderable` private SPI; cheap to share across processes/threads without a JPEG/HTTP round-trip. The reason this project can skip Radon's MJPEG indirection.
+- **`sim-server` (Option A)** — Out-of-process Swift/Obj-C++ daemon that links `FBSimulatorControl`, owns the headless `SimDevice`, and exposes `IOSurface` IDs + JSON-RPC input over a Unix socket. Prototype-stage only; collapsed into cmux at M2 (Option B).
+- **Fork-then-upstream-PR** — The project's contribution model (see [ADR-0002](./adr/0002-fork-then-upstream-pr.md)). All changes prototyped on this fork of `manaflow-ai/cmux` are eventually proposed back as a PR; the fork is not the shipping artifact.
+- **Workflow scaffold** — Files in this fork that exist to coordinate the project (PRD, ADRs, glossary, `.memory/`, the project-overlay section in `CLAUDE.md`, the workflow-plugin enablement in `.claude/settings.json`). Removed before the upstream PR per ADR-0003. Not shipped to upstream cmux.
