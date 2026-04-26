@@ -16140,15 +16140,10 @@ export default CMUXSessionRestore;
         print("Cleared \(path.path)")
     }
 
-    // MARK: - iOS Simulator wrapper (Spike #1)
-    //
-    // Tiny wrapper around `xcrun simctl` for boot/shutdown/install lifecycle of a
-    // single named device. This is the sanity baseline for the `SurfaceType.simulator`
-    // work — it proves cmux can lifecycle a named iOS Simulator without touching
-    // private SPI. See docs/spikes/01-simctl-wrapper.md for the spike write-up.
-    //
-    // The implementation runs entirely locally and does NOT route over the cmux
-    // Unix socket (matches the precedent of `opencode install-hooks` and `feed clear`).
+    // MARK: - iOS Simulator wrapper
+
+    // Runs locally — does NOT route over the cmux Unix socket
+    // (matches `opencode install-hooks`, `feed clear`).
 
     private struct SimctlDevice {
         let udid: String
@@ -16228,7 +16223,7 @@ export default CMUXSessionRestore;
     private func runSimctlShutdown(deviceArg: String) throws {
         let device = try resolveSimulatorDevice(nameOrUDID: deviceArg)
         let result = runSimctlProcess(arguments: ["shutdown", device.udid])
-        if result.status == 0 {
+        if result.status == 0 || simctlStderrIndicatesAlreadyShutdown(result.stderr) {
             print("Shutdown \(device.name) (\(device.udid))")
             return
         }
@@ -16270,6 +16265,8 @@ export default CMUXSessionRestore;
             // Even if the device doesn't appear in `list devices` (e.g., not yet
             // available), allow the caller to use the UDID directly. This matches
             // simctl's own behavior of accepting any UDID on the command line.
+            // Synthetic device — `isAvailable` is unknown but mirrors simctl's
+            // permissive acceptance of any UDID-shaped string.
             return SimctlDevice(
                 udid: upper,
                 name: upper,
@@ -16364,6 +16361,16 @@ export default CMUXSessionRestore;
         // Some Xcode betas: "device is already booted" (rare, defensive).
         return lower.contains("current state: booted")
             || lower.contains("already booted")
+    }
+
+    private func simctlStderrIndicatesAlreadyShutdown(_ stderr: String) -> Bool {
+        // Apple emits the canonical phrase with capitalized "Shutdown":
+        //   "Unable to shutdown device in current state: Shutdown"
+        // Match that case-sensitively, plus a defensive lowercase variant
+        // ("already shutdown") seen across older Xcode versions.
+        let lower = stderr.lowercased()
+        return stderr.contains("current state: Shutdown")
+            || lower.contains("already shutdown")
     }
 
     private func simctlTrimmedStderr(_ result: CLIProcessResult) -> String {

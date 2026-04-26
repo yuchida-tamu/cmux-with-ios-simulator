@@ -21,6 +21,12 @@ Add a `cmux sim` subcommand to the cmux CLI binary (`CLI/cmux.swift`) that lifec
 8. Write `docs/spikes/01-simctl-wrapper.md` documenting: what shipped, what worked, the **headless-device limitation** (`simctl boot` boots through `CoreSimulatorService` and is not a true headless `SimDevice` — that's the limitation Spike #2 addresses), the device-name tiebreaker rule (latest runtime wins), the Xcode version tested, and the manual end-to-end verification command list.
 9. Run `swift build` and verify it succeeds. Verify the unit-test target compiles via `xcodebuild -scheme cmux-unit ... build` if SPM doesn't catch CLI-target errors.
 
+## Review findings addressed (PR #6)
+
+- **Shutdown idempotency (SHOULD-FIX #1).** Mirrored the boot-side helper: added `simctlStderrIndicatesAlreadyShutdown(_:)` next to `simctlStderrIndicatesAlreadyBooted(_:)`. It matches `current state: Shutdown` case-sensitively (Apple emits "Shutdown" with a capital S in the canonical message `Unable to shutdown device in current state: Shutdown`) and `already shutdown` case-insensitively as a defensive variant. `runSimctlShutdown` now treats a non-zero exit whose stderr matches this helper as success, printing the standard `Shutdown <name> (<UDID>)` line. This eliminates the empirically reproduced exit 149 when shutting down an already-shutdown device.
+- **Comment trim (SHOULD-FIX #2).** Reduced the `// MARK: - iOS Simulator wrapper` block in `CLI/cmux.swift` to keep only the architecturally non-obvious invariant ("Runs locally — does NOT route over the cmux Unix socket"). Removed the "Spike #1" reference, the "sanity baseline" framing, the "proves cmux can …" justification, and the spike write-up pointer, per CLAUDE.md comment policy.
+- **Synthetic-device `isAvailable` annotation (NIT).** Added a one-line comment in `resolveSimulatorDevice` documenting that the synthetic `SimctlDevice` returned for unknown UDIDs sets `isAvailable: true` to mirror simctl's permissive UDID acceptance, not because availability is known.
+
 ## Constraints
 
 - **ADR-0002** (Fork-then-upstream-PR): All code changes in `CLI/cmux.swift` ship to upstream. Match upstream conventions strictly:
@@ -139,6 +145,7 @@ Per-criterion verification:
 - **End-to-end manual test: `cmux sim boot 'iPhone 15 Pro'` returns a UDID and the simulator appears in `xcrun simctl list`.** → Documented as a copy-pasteable command sequence in `docs/spikes/01-simctl-wrapper.md`. Manually executed on the agent's host before declaring the implementation complete.
 - **Spike write-up landed in `docs/spikes/01-simctl-wrapper.md` summarizing what worked and what limitations motivate Spike 2.** → File presence is verified by `self-check` against the file manifest.
 - **All upstream cmux tests still pass (upstream's check command).** → CLAUDE.md mandates "Never run tests locally"; verified post-PR by GitHub Actions / VM. Locally the agent runs `swift build` (PostToolUse hook) and optionally `xcodebuild -scheme cmux-unit ... build` to confirm the unit-test target compiles.
+- **Shutdown idempotency (PR #6 review).** → Manual: `cmux sim shutdown <device>` twice in a row, both exit 0. The second invocation is the regression case — without the fix it exits 149 with stderr `Unable to shutdown device in current state: Shutdown` (empirically reproduced by the orchestrator before the fix). The orchestrator re-runs this manually after the fix lands.
 
 ## Open questions
 
