@@ -1963,6 +1963,13 @@ struct CMUXCLI {
             }
         }
 
+        // iOS Simulator lifecycle (no socket needed; shells out to xcrun simctl).
+        // Spike #1 — see docs/spikes/01-simctl-wrapper.md.
+        if command == "sim" {
+            try runSimctl(commandArgs: commandArgs)
+            return
+        }
+
         // OpenCode plugin install/uninstall (plugin JS, not a hook file)
         if command == "opencode" {
             let sub = commandArgs.first?.lowercased() ?? "help"
@@ -7102,6 +7109,31 @@ struct CMUXCLI {
             Usage: cmux feed clear [--yes|-y]
 
             Manage persisted Feed workstream history.
+            """
+        case "sim":
+            return """
+            Usage: cmux sim <list|boot|shutdown|install> [args]
+
+            Lifecycle iOS Simulator devices via `xcrun simctl`. Runs locally — does not
+            require a running cmux app.
+
+            Subcommands:
+              list                              List available simulator devices (name, UDID, runtime, state)
+              boot <device-name|udid>           Boot a device by name or UDID; prints the UDID on success
+                                                (idempotent — already-booted devices are treated as success)
+              shutdown <device-name|udid>       Shut down a booted device
+              install <device-name|udid> <app>  Install an .app bundle on the device
+
+            Device lookup:
+              When you pass a name (e.g., 'iPhone 15 Pro'), the latest available iOS
+              runtime wins if multiple devices share the same name. Pass a UDID to bypass
+              this tiebreaker.
+
+            Examples:
+              cmux sim list
+              cmux sim boot 'iPhone 15 Pro'
+              cmux sim shutdown 'iPhone 15 Pro'
+              cmux sim install 'iPhone 15 Pro' /path/to/MyApp.app
             """
         case "opencode":
             return """
@@ -16108,6 +16140,255 @@ export default CMUXSessionRestore;
         print("Cleared \(path.path)")
     }
 
+    // MARK: - iOS Simulator wrapper
+
+    // Runs locally — does NOT route over the cmux Unix socket
+    // (matches `opencode install-hooks`, `feed clear`).
+
+    private struct SimctlDevice {
+        let udid: String
+        let name: String
+        let state: String
+        let isAvailable: Bool
+        let runtimeIdentifier: String
+        let deviceTypeIdentifier: String?
+    }
+
+    private func runSimctl(commandArgs: [String]) throws {
+        let sub = commandArgs.first?.lowercased() ?? "help"
+        let rest = Array(commandArgs.dropFirst())
+        switch sub {
+        case "list":
+            try runSimctlList()
+        case "boot":
+            guard let device = rest.first, !device.isEmpty else {
+                throw CLIError(message: "Usage: cmux sim boot <device-name|udid>")
+            }
+            try runSimctlBoot(deviceArg: device)
+        case "shutdown":
+            guard let device = rest.first, !device.isEmpty else {
+                throw CLIError(message: "Usage: cmux sim shutdown <device-name|udid>")
+            }
+            try runSimctlShutdown(deviceArg: device)
+        case "install":
+            guard rest.count >= 2 else {
+                throw CLIError(message: "Usage: cmux sim install <device-name|udid> <app-path>")
+            }
+            try runSimctlInstall(deviceArg: rest[0], appPath: rest[1])
+        case "help", "--help", "-h":
+            if let text = subcommandUsage("sim") {
+                print("cmux sim")
+                print("")
+                print(text)
+            }
+        default:
+            throw CLIError(message: "Unknown sim subcommand: \(sub). Run 'cmux sim --help' for usage.")
+        }
+    }
+
+    private func runSimctlList() throws {
+        let devices = try simctlListDevices()
+        if devices.isEmpty {
+            print("No available simulator devices found.")
+            return
+        }
+        // Sort: name asc, then runtime desc (latest first).
+        let sorted = devices.sorted { lhs, rhs in
+            if lhs.name != rhs.name { return lhs.name < rhs.name }
+            return lhs.runtimeIdentifier > rhs.runtimeIdentifier
+        }
+        // Compute column widths for a tidy listing.
+        let nameWidth = max(4, sorted.map { $0.name.count }.max() ?? 4)
+        let stateWidth = max(5, sorted.map { $0.state.count }.max() ?? 5)
+        let header = "\(String("NAME".padding(toLength: nameWidth, withPad: " ", startingAt: 0)))  \(String("STATE".padding(toLength: stateWidth, withPad: " ", startingAt: 0)))  UDID                                  RUNTIME"
+        print(header)
+        for device in sorted {
+            let name = device.name.padding(toLength: nameWidth, withPad: " ", startingAt: 0)
+            let state = device.state.padding(toLength: stateWidth, withPad: " ", startingAt: 0)
+            let runtimeShort = simctlShortRuntimeName(device.runtimeIdentifier)
+            print("\(name)  \(state)  \(device.udid)  \(runtimeShort)")
+        }
+    }
+
+    private func runSimctlBoot(deviceArg: String) throws {
+        let device = try resolveSimulatorDevice(nameOrUDID: deviceArg)
+        let result = runSimctlProcess(arguments: ["boot", device.udid])
+        if result.status == 0 || simctlStderrIndicatesAlreadyBooted(result.stderr) {
+            print(device.udid)
+            return
+        }
+        throw CLIError(message: "simctl boot failed (status \(result.status)): \(simctlTrimmedStderr(result))")
+    }
+
+    private func runSimctlShutdown(deviceArg: String) throws {
+        let device = try resolveSimulatorDevice(nameOrUDID: deviceArg)
+        let result = runSimctlProcess(arguments: ["shutdown", device.udid])
+        if result.status == 0 || simctlStderrIndicatesAlreadyShutdown(result.stderr) {
+            print("Shutdown \(device.name) (\(device.udid))")
+            return
+        }
+        throw CLIError(message: "simctl shutdown failed (status \(result.status)): \(simctlTrimmedStderr(result))")
+    }
+
+    private func runSimctlInstall(deviceArg: String, appPath: String) throws {
+        let device = try resolveSimulatorDevice(nameOrUDID: deviceArg)
+        let expanded = (appPath as NSString).expandingTildeInPath
+        let absolute: String
+        if expanded.hasPrefix("/") {
+            absolute = expanded
+        } else {
+            absolute = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(expanded)
+                .standardizedFileURL.path
+        }
+        guard FileManager.default.fileExists(atPath: absolute) else {
+            throw CLIError(message: "App bundle not found at \(absolute)")
+        }
+        let result = runSimctlProcess(arguments: ["install", device.udid, absolute])
+        if result.status == 0 {
+            print("Installed \(absolute) on \(device.name) (\(device.udid))")
+            return
+        }
+        throw CLIError(message: "simctl install failed (status \(result.status)): \(simctlTrimmedStderr(result))")
+    }
+
+    /// Resolve a `<name>|<udid>` argument to a `SimctlDevice`. Fast-paths UDIDs.
+    /// For names, picks the entry whose runtime identifier sorts last (latest iOS
+    /// runtime by lexicographic order — documented in the spike write-up).
+    private func resolveSimulatorDevice(nameOrUDID: String) throws -> SimctlDevice {
+        if simctlLooksLikeUDID(nameOrUDID) {
+            let upper = nameOrUDID.uppercased()
+            let devices = try simctlListDevices()
+            if let match = devices.first(where: { $0.udid.uppercased() == upper }) {
+                return match
+            }
+            // Even if the device doesn't appear in `list devices` (e.g., not yet
+            // available), allow the caller to use the UDID directly. This matches
+            // simctl's own behavior of accepting any UDID on the command line.
+            // Synthetic device — `isAvailable` is unknown but mirrors simctl's
+            // permissive acceptance of any UDID-shaped string.
+            return SimctlDevice(
+                udid: upper,
+                name: upper,
+                state: "Unknown",
+                isAvailable: true,
+                runtimeIdentifier: "",
+                deviceTypeIdentifier: nil
+            )
+        }
+        let devices = try simctlListDevices()
+        let matches = devices.filter { $0.isAvailable && $0.name == nameOrUDID }
+        guard !matches.isEmpty else {
+            throw CLIError(message: "No available simulator named '\(nameOrUDID)'. Run 'cmux sim list' to see available devices.")
+        }
+        // Tiebreaker: sort runtime identifier descending (latest iOS runtime wins).
+        let sorted = matches.sorted { $0.runtimeIdentifier > $1.runtimeIdentifier }
+        return sorted[0]
+    }
+
+    private func simctlListDevices() throws -> [SimctlDevice] {
+        let result = runSimctlProcess(arguments: ["list", "devices", "--json"])
+        guard result.status == 0 else {
+            throw CLIError(message: "simctl list devices failed (status \(result.status)): \(simctlTrimmedStderr(result))")
+        }
+        guard let data = result.stdout.data(using: .utf8) else {
+            throw CLIError(message: "simctl list devices returned non-UTF8 output")
+        }
+        let json: Any
+        do {
+            json = try JSONSerialization.jsonObject(with: data, options: [])
+        } catch {
+            throw CLIError(message: "simctl list devices JSON parse failed: \(error)")
+        }
+        guard let root = json as? [String: Any],
+              let devicesByRuntime = root["devices"] as? [String: Any] else {
+            throw CLIError(message: "simctl list devices: missing 'devices' object in JSON")
+        }
+        var out: [SimctlDevice] = []
+        for (runtime, value) in devicesByRuntime {
+            guard let entries = value as? [[String: Any]] else { continue }
+            for entry in entries {
+                guard let udid = entry["udid"] as? String,
+                      let name = entry["name"] as? String,
+                      let state = entry["state"] as? String else {
+                    continue
+                }
+                let isAvailable = (entry["isAvailable"] as? Bool) ?? false
+                let deviceType = entry["deviceTypeIdentifier"] as? String
+                out.append(SimctlDevice(
+                    udid: udid,
+                    name: name,
+                    state: state,
+                    isAvailable: isAvailable,
+                    runtimeIdentifier: runtime,
+                    deviceTypeIdentifier: deviceType
+                ))
+            }
+        }
+        return out
+    }
+
+    private func runSimctlProcess(arguments: [String]) -> CLIProcessResult {
+        return CLIProcessRunner.runProcess(
+            executablePath: "/usr/bin/xcrun",
+            arguments: ["simctl"] + arguments
+        )
+    }
+
+    private func simctlLooksLikeUDID(_ s: String) -> Bool {
+        // 8-4-4-4-12 hex (case-insensitive). simctl UDIDs are uppercase but accept
+        // mixed-case input.
+        guard s.count == 36 else { return false }
+        let chars = Array(s)
+        let dashes: Set<Int> = [8, 13, 18, 23]
+        for (i, ch) in chars.enumerated() {
+            if dashes.contains(i) {
+                if ch != "-" { return false }
+            } else {
+                let isHex = (ch >= "0" && ch <= "9")
+                    || (ch >= "a" && ch <= "f")
+                    || (ch >= "A" && ch <= "F")
+                if !isHex { return false }
+            }
+        }
+        return true
+    }
+
+    private func simctlStderrIndicatesAlreadyBooted(_ stderr: String) -> Bool {
+        let lower = stderr.lowercased()
+        // Older Xcode versions: "Unable to boot device in current state: Booted"
+        // Newer Xcode versions: exit 0 directly (so this only matters for older Xcode).
+        // Some Xcode betas: "device is already booted" (rare, defensive).
+        return lower.contains("current state: booted")
+            || lower.contains("already booted")
+    }
+
+    private func simctlStderrIndicatesAlreadyShutdown(_ stderr: String) -> Bool {
+        // Apple emits the canonical phrase with capitalized "Shutdown":
+        //   "Unable to shutdown device in current state: Shutdown"
+        // Match that case-sensitively, plus a defensive lowercase variant
+        // ("already shutdown") seen across older Xcode versions.
+        let lower = stderr.lowercased()
+        return stderr.contains("current state: Shutdown")
+            || lower.contains("already shutdown")
+    }
+
+    private func simctlTrimmedStderr(_ result: CLIProcessResult) -> String {
+        let trimmed = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        let trimmedOut = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedOut.isEmpty ? "(no output)" : trimmedOut
+    }
+
+    private func simctlShortRuntimeName(_ identifier: String) -> String {
+        // Strip the long Apple-internal prefix for display.
+        let prefix = "com.apple.CoreSimulator.SimRuntime."
+        if identifier.hasPrefix(prefix) {
+            return String(identifier.dropFirst(prefix.count))
+        }
+        return identifier
+    }
+
     // MARK: - OpenCode plugin install
 
     /// Marker matching the `// cmux-feed-plugin-marker` line emitted at
@@ -17354,6 +17635,9 @@ export default CMUXSessionRestore;
           display-message [-p|--print] <text>
 
           markdown [open] <path>             (open markdown file in formatted viewer panel with live reload)
+
+          sim <list|boot|shutdown|install> [device-name|udid] [app-path]
+                                             (lifecycle iOS Simulator devices via xcrun simctl)
 
           browser [--surface <id|ref|index> | <surface>] <subcommand> ...
           browser open [url]                   (create browser split in caller's workspace; if surface supplied, behaves like navigate)
